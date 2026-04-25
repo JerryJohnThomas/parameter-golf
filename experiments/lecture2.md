@@ -340,5 +340,83 @@ More capacity wins over higher precision.
   * It distributes the brain damage across the network so the model barely feels it
   * [GOLF] GEMINI: dont use it now since its time consuming, The Math takes time: To figure out how to compensate for the error, GPTQ has to run a "calibration dataset" through the model and calculate massive second-order derivatives. If you spend 60 seconds running GPTQ, that is 60 seconds you aren't running your Muon optimizer. In this competition, 60 seconds of extra raw training time usually lowers your BPB more than the fancy GPTQ math does.
 
+# Evaluation Tricks — Sliding Window & TTT
+
+## Standard Evaluation / Inference
+
+```
+val text: [token_1, token_2, ..., token_50000]
+
+Split into chunks of seq_len=1024:
+Chunk 1: tokens [0:1024]    → compute loss
+Chunk 2: tokens [1024:2048] → compute loss
+Chunk 3: tokens [2048:3072] → compute loss
+...
+Average all losses → val_bpb
+```
+
+Problems
+* Each chunk is evaluated independently. Token 0 of chunk 2 has no context from chunk 1
+* At the boundary between chunks, the first few tokens of each new chunk have very little context — they're starting fresh.
+
+
+##  Sliding Window Evaluation
+
+Instead of non-overlapping chunks, use overlapping windows
+```
+Window 1: tokens [0:1024]     → predict token 1024, use tokens 0-1023 as context
+Window 2: tokens [1:1025]     → predict token 1025, use tokens 1-1024 as context
+Window 3: tokens [2:1026]     → predict token 1026, use tokens 2-1025 as context
+```
+Every token now has maximum context (1024 tokens before it). No cold starts at chunk boundaries.
+Cost: much more compute — you run 1024× more forward passes.
+Gain: meaningfully better BPB because every prediction is well-contextualized
+
+
+
+##  Eval / Test Time Training (TTT)
+
+* feels illegal, but isn't
+* During evaluation, as you process each token, you fine-tune the model on tokens you've already predicted.
+```
+See token_1 → predict token_2 → score prediction
+→ now fine-tune on (token_1 → token_2) pair
+→ see token_2 → predict token_3 (with updated weights)
+→ fine-tune on (token_2 → token_3)
+→ ...
+```
+* [GOLF] - The rules explicitly allow it. "You may update model weights during evaluation, provided you only condition on tokens whose loss has already been computed." No future information. Strictly causal. Allowed.
+* 
+
+### The practical implementation
+```python
+# During evaluation loop:
+for i, token in enumerate(val_tokens):
+    # 1. Predict next token (BEFORE any update)
+    with torch.no_grad():
+        loss = model(context)
+    
+    # 2. Record loss for BPB
+    total_loss += loss
+    
+    # 3. Fine-tune on this token (AFTER prediction)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    
+    # 4. Move to next token with updated weights
+```
+
+**The ability for a model to dynamically adapt and learn in context, at the edge, without needing a massive multi-million dollar retraining run, is the holy grail of efficiency.**
+
+### Claude suggestion
+
+* Combining both tricks
+* The strongest records combine sliding window + TTT:
+  Sliding window: every token gets maximum context
+  TTT:            model adapts to current document on the fly
+  Combined:       meaningful BPB improvement over standard eval
+
+* Honest answer — TTT is complex to implement correctly. Risk of subtle bugs that invalidate your submission.
 
 
