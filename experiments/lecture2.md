@@ -203,6 +203,142 @@ V = the actual books (can be shared)
 * The Golden Rule of GQA: It is much better for a model to be incredibly inquisitive (many $Q$ heads) while searching a compressed database (few $K/V$ heads), than to be a simple-minded model (few $Q$ heads) searching a massive, highly-detailed database.
 
 
+# Muon optimizer
+
+## Problem
+* Standard optimizers, like AdamW, update every single parameter in that matrix individually based on its own gradient.
+* Adam treat each parameter independently and ignore's the matrix structure
+* Sometimes if learning rate is high, Adam will perform a dimension collapse, Instead of exploring a rich, 512-dimensional representation space, the matrix effectively flattens out, squishing all the tokens into a narrow mathematical corner
+* yeah i get it not very convincing "')
+
+## Solution
+* we do orthogonal updates to the matrix
+* The optimal update to a weight matrix, if you want to move in the steepest descent direction while keeping the update the same "size", is the orthogonalized gradient
+
+DOUBT: I dont fully get the above point, I understand in adam you mean in negative gradient for a minima point, but not really sure here
+* Claude: Imagine your weight matrix W is doing a transformation in space. The gradient G tells you how to change W. But G might be "lopsided" — it wants to change some directions in the transformation a lot and barely touch others. Orthogonalizing G means: "Keep the same general direction of change, but make the update equally sized in ALL directions of the matrix transformation."
+* Gemini: think of W as a space and we have a sphere, if gradients says right, Adam may stretch the right side and we can get a pan cake, but muon will move the entire thing a bit to the right 
+
+## Hybrid Optimiser strategy of Muon and Adam
+* Muon is a Specialist, Not a Generalist
+*  Muon relies on 2D matrix orthogonalization, it only works on 2D hidden weights (like $W_Q, W_K, W_V, W_1, W_2$).
+* Muon handles all the 2D weights in the Transformer blocks (Attention & MLP) with a very high learning rate.
+* Adam for everything else, AdamW handles the 1D scalars, the norms, and the input/output Embeddings.
+
+
+# Tied Embeddings / Weight Tying
+* Basically the matrix you are using to encode tokens to embeddings is the same matrix you use for decoding logits to tokens, instead of using 2 seperated matrices
+* this comes very natural to us, since we are intuitive thinkers
+
+the flow visualised
+```
+final embedding/ hidden state [512 dim]
+        ↓
+× tok_emb.weight.T    ← tied embedding matrix, transposed
+        ↓
+logits [1024 dim]     ← one score per vocab token
+        ↓
+softmax
+        ↓
+probability distribution over vocab
+        ↓
+sample/argmax → token ID
+```
+
+# BF16/FP32 Casting
+
+## What
+* FP32 (Float32): This is the standard 32-bit floating-point math, 4 bytes per number. High Precision
+* BF16 (bfloat16) : 2 bytes per number. Lower Precision
+* we use BF16 over FP32 as it saves memory, It runs the massive matrix multiplications on the Tensor Cores at lightning speed
+* So why not use BF16 everywhere? because there are some things that need the high precision or it will break.
+
+## mixed precision training
+* this is the optimal solution
+* To get the speed of 16-bit and the safety of 32-bit, you use PyTorch's **autocast** to juggle both at the exact same time
+* What the baseline actually does — mixed precision
+```
+Weights stored:      BF16  ← fast, memory efficient
+Forward pass:        BF16  ← fast matmuls on H100
+Gradients:           BF16  ← fast
+Optimizer states:    FP32  ← needs precision for tiny updates
+Loss:                FP32  ← needs precision
+```
+
+
+# Quantization
+
+## Motivation
+* After training, weights are in BF16 — 2 bytes per parameter. 14M params × 2 bytes = 28MB
+* Instead of storing the exact float value, store an integer approximation
+```
+Original weight: 0.3847 (BF16, 16 bits)
+Quantized:       49     (int8, 8 bits)
+```
+
+## The Math
+
+1. Find the absolute maximum value in the weight matrix (e.g., 2.5).
+2. Calculate the Scale: Divide that max value by the maximum bucket number.
+  * For INT8, the max bucket is 127.
+  * Scale = 2.5 / 127 = 0.0196
+3. Quantize: Take every parameter, divide it by the scale, and round it to the nearest whole integer.
+  * Quantized_Weight = Round(Weight / Scale)
+  * A weight of 1.14 becomes Round(1.14 / 0.0196) = 58.
+
+When the server runs inference, it simply multiplies 58 by the scale (0.0196) to get 1.136.
+Notice the Quantization Error: We started with 1.14, but we recovered 1.136. The model just got a tiny bit "dumber."
+
+* This is done per row in the matrix, since each row will have different maximum numbers (why? explained below in the new problem)
+
+## The new problem
+* Problem: Language models naturally develop "outlier" features—a single parameter in a matrix might explode to a massive number like 50.0, while the other 99% of the parameters hover around 0.1.
+* Solution: 
+  * Grouped Quantization- Instead of calculating one single Scale for the entire $512 \times 512$ matrix, you calculate a new Scale for every 64 or 128 numbers
+  * * This is done per row in the matrix, since each row will have different maximum numbers (as explained above)
+
+## More Advanced - int4, int5, int6
+```
+int8:  8 bits → 1.000 bytes/weight → 256 levels
+int6:  6 bits → 0.750 bytes/weight → 64 levels
+int5:  5 bits → 0.625 bytes/weight → 32 levels
+int4:  4 bits → 0.500 bytes/weight → 16 levels
+```
+* so the idea here is just like above they divide with the max value
+
+```
+int8:  scale = max(abs(weights)) / 127
+int4:  scale = max(abs(weights)) / 7
+int5:  scale = max(abs(weights)) / 15
+int6:  scale = max(abs(weights)) / 31
+```
+* now the problem is we only store in byte in the CPU right, so int4 is fine since its half a  byte
+* but storing int5, int6 is a hard task
+* 5 bits doesn't divide evenly into 8 bits. So you pack 8 weights into 5 bytes:
+```
+Weight 1: aaaaa
+Weight 2: bbbbb
+Weight 3: ccccc
+...
+Packed: aaaaabbb bbcccccd ddeeeeef ffggggg? ...
+```
+* Same thing with int6, we pack 4 of them since 6 * 4 = 24 is divisible by 8, you get the idea right
+* note: this practise is done in the leader board that's why this is mentioned, there are libraries for this
+
+## GOLF QUANTISATION KEY INSIGHT
+
+The key insight from the leaderboard:
+
+> The quality loss from lower precision is MORE than compensated by fitting a bigger model. Baseline:  9 layers int8  → 5MB artifact, BPB 1.22
+Records:   11 layers int5 → 14MB artifact, BPB 1.08
+More capacity wins over higher precision.
+
+## Other Mentions
+* (Generalized Post-Training Quantization) is "smart."
+  * The big idea is when you quantize weight W_i and introduce error ε, adjust neighboring weights to compensate for that error.
+  * If you force one weight down into an integer bucket (creating quantization error), GPTQ mathematically calculates exactly how much to push the neighboring weights up to compensate for that error.
+  * It distributes the brain damage across the network so the model barely feels it
+  * [GOLF] GEMINI: dont use it now since its time consuming, The Math takes time: To figure out how to compensate for the error, GPTQ has to run a "calibration dataset" through the model and calculate massive second-order derivatives. If you spend 60 seconds running GPTQ, that is 60 seconds you aren't running your Muon optimizer. In this competition, 60 seconds of extra raw training time usually lowers your BPB more than the fancy GPTQ math does.
 
 
 

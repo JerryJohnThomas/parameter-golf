@@ -125,10 +125,28 @@ Question: if it happens after the computation then wont probleems like data leak
 
 This is critical — it means even if attention learns nothing useful, the original token representation still flows through unchanged. It's what makes training deep networks stable.
 
+Residual stream = the single vector per token that accumulates ALL contributions from ALL blocks additively.
+Each block writes a small update, never replaces.
+More layers = more writes = better BPB.
+
+
+
 ### Layer Normalization (Norm)
 Adding vectors together changes their mean and variance, which can cause the numbers to spiral out of control in deep networks. Layer Normalization steps in immediately after the addition to re-center and scale the values back to a stable baseline.
 
 `output = LayerNorm(x + attention_output)`
+
+
+* the above is post norm that was used in attention is all you need
+* now we have pre norm in modern systems
+```
+### Modern "Pre-Norm" Residual Connection
+# The data is normalized BEFORE entering the block, keeping the main highway completely untouched.
+
+x = x + attention(LayerNorm(x))
+x = x + mlp(LayerNorm(x))
+```
+* [golf]: the baseline uses RMSNorm instead of LayerNorm in the preNorm methodolgy
 
 
 ## Routing
