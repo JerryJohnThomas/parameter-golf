@@ -31,6 +31,14 @@ Parameter Size
 * If your hidden dimension is 768 and your vocabulary is 50,000, then $50,000 \times 768 \approx 38.4$ million parameters.
 * In Parameter Golf, 38M parameters is roughly 150MB (at float32). You would fail the 16MB limit instantly.
 
+question: so big tokenizer iwth big vocabular and small vocabulary is the differnese in the output dimensino or the hidden dimension which is the output dimension
+Answer:
+* Neither — it's the vocab dimension specifically.
+* The embedding table shape is - `[vocab_size × hidden_dim]`
+* Hidden dim (512) stays fixed regardless of vocab size. What changes is vocab_size:
+* So bigger vocab = bigger embedding table = more params = less room for transformer layers in 16MB.
+
+
 Efficiency Gain
 * On the flip side, a larger vocabulary makes the model faster at processing text.
 * If a sentence is 10 tokens instead of 50 tokens, the Self-Attention mechanism (which is $O(n^2)$) has $5^2$ ($25\times$) less work to do
@@ -104,7 +112,7 @@ Step 1: Compute the New Vectors
 Step 2: The Query Asks the Questions
 * Word 1001 needs to figure out its context. It uses its Query ($Q_{1001}$) to "ask" all the previous words: "Hey, I am word 1001. Which of you previous words are mathematically relevant to me right now?"
 * To get the answer, $Q_{1001}$ is multiplied (dot product) against the Keys ($K$) of all 1,000 previous words, plus its own Key.
-`$$\text{Scores} = Q_{1001} \cdot [K_1, K_2, K_3, ..., K_{1000}, K_{1001}]$$`
+$$\text{Scores} = Q_{1001} \cdot [K_1, K_2, K_3, ..., K_{1000}, K_{1001}]$$
 
 Step 3:
 * Output Computation with the attention scores multiplied with V
@@ -126,7 +134,7 @@ To solve this problem we introduced two things
 * Multi-Query Attention (MQA) - The Extreme Squeeze
   * Share one set of Keys and Values across all the Query heads.
   * Architecture: 32 $Q$ heads, but only 1 $K$ head and 1 $V$ head.
-  * Result: The KV cache size shrinks by $32\times$! Inference becomes incredibly fast.
+  * Result: The KV cache size shrinks by $32\times 1$ Inference becomes incredibly fast.
   * problem: we loose a lot of variation theoretically giving the same answer to different kinds of queries.
 
 
@@ -138,7 +146,13 @@ To solve this problem we introduced two things
   * Result: You still slash your KV Cache memory footprint (in this case, by an $8\times$ reduction compared to MHA), but because the queries are grouped logically, the model retains almost all of the performance and reasoning quality of standard MHA.
 
 
-doubt: how does inference have anything to do with model training weight size
+Question: how does inference have anything to do with model training weight size
+Answer
+* KV cache is purely an inference optimization. It has zero effect on training or model weight size.
+* The reason GQA appears in both contexts is:
+  * At inference: GQA reduces KV cache memory (fewer K/V vectors to store per token)
+  * At training/parameter golf: GQA reduces W_K and W_V parameter count (smaller matrices to store in 16MB)
+* [GOLF] Same architectural change, two separate benefits. In this competition we care about the second one — parameter savings — not the inference speed benefit.
 
 # GQA — Grouped Query Attention
 
@@ -171,11 +185,22 @@ Q head 7 ─┴─→ shares K[3], V[3]
 ```
 
 
-
-
-* 
-* 
-* 
+Question: we are only thinking about decreasing the number K and V< why not think about decreasing Q heads here?
+Answer
+* The Query ($Q$) is the "Asker." The number of $Q$ heads determines how many different, complex questions the current token can ask the context at the exact same time.
+  * For the word "apple":
+  * Head 1 might ask: "Is this the fruit or the tech company?"
+  * Head 2 might ask: "Is this the subject or the object of the sentence?"
+  * Head 3 might ask: "What color is being described?"
+* The Keys and Values ($K, V$) are the "Database."
+  *  Researchers found that you don't actually need 32 separate databases to answer 32 different questions. Several $Q$ heads can query the exact same $K/V$ database and still extract the specific information they need.
+* Or another analogy, Think of it like a library:
+```
+Q = different readers asking different questions
+K = the card catalogue (can be shared)
+V = the actual books (can be shared)
+```
+* The Golden Rule of GQA: It is much better for a model to be incredibly inquisitive (many $Q$ heads) while searching a compressed database (few $K/V$ heads), than to be a simple-minded model (few $Q$ heads) searching a massive, highly-detailed database.
 
 
 
